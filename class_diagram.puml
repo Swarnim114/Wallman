@@ -1,0 +1,38 @@
+@startuml
+skinparam classAttributeIconSize 0
+
+' --- Traits & Structs ---
+interface "IndexingStrategy" as Strategy <<trait>> {
+    +index(target_path: &Path, extensions: &[String]): Vec<PathBuf>
+}
+
+class SameDirectoryStrategy <<struct>> {
+    +index(target_path: &Path, extensions: &[String]): Vec<PathBuf>
+}
+
+class RecursiveDirectoryStrategy <<struct>> {
+    +index(target_path: &Path, extensions: &[String]): Vec<PathBuf>
+}
+
+class HomeDirectoryStrategy <<struct>> {
+    +index(target_path: &Path, extensions: &[String]): Vec<PathBuf>
+}
+
+' --- The Context / Owner ---
+class ImageIndexer <<struct>> {
+    -strategy: Box<dyn IndexingStrategy>
+    -allowed_extensions: Vec<String>
+    +new(strategy: Box<dyn IndexingStrategy>): Self
+    +set_strategy(strategy: Box<dyn IndexingStrategy>): void
+    +set_filters(extensions: Vec<String>): void
+    +execute(target_path: &Path): Vec<PathBuf>
+}
+
+' --- Relationships ---
+Strategy <|-- SameDirectoryStrategy : implements
+Strategy <|-- RecursiveDirectoryStrategy : implements
+Strategy <|-- HomeDirectoryStrategy : implements
+
+ImageIndexer "1" *--> "1" Strategy : owns (Box<dyn>)
+
+@enduml
