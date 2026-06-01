@@ -1,5 +1,5 @@
-use crate::vault::index::strategy::IndexingStrategy;
-use crate::vault::index::utils::has_allowed_extension;
+use crate::vault::index::indexing_strategy::IndexingStrategy;
+use crate::vault::index::utils::has_matching_extension;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -10,7 +10,7 @@ impl IndexingStrategy for RecursiveDirectoryStrategy {
         let mut results = Vec::new();
         for entry in WalkDir::new(target_path).into_iter().filter_map(|e| e.ok()) {
             let path = entry.into_path();
-            if path.is_file() && has_allowed_extension(&path, extensions) {
+            if path.is_file() && has_matching_extension(&path, extensions) {
                 results.push(path);
             }
         }

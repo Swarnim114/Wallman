@@ -1,4 +1,4 @@
-use crate::vault::index::strategy::IndexingStrategy;
+use crate::vault::index::indexing_strategy::IndexingStrategy;
 use std::path::{Path, PathBuf};
 
 pub struct ImageIndexer {
@@ -14,9 +14,9 @@ impl ImageIndexer {
         }
     }
 
-    pub fn set_strategy(&mut self, strategy: Box<dyn IndexingStrategy>) {
-        self.strategy = strategy;
-    }
+    // pub fn set_strategy(&mut self, strategy: Box<dyn IndexingStrategy>) {
+    //     self.strategy = strategy;
+    // }
 
     pub fn set_filters(&mut self, extensions: Vec<String>) {
         self.allowed_extensions = extensions;

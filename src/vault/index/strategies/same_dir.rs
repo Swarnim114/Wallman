@@ -1,5 +1,5 @@
-use crate::vault::index::strategy::IndexingStrategy;
-use crate::vault::index::utils::has_allowed_extension;
+use crate::vault::index::indexing_strategy::IndexingStrategy;
+use crate::vault::index::utils::has_matching_extension;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -11,7 +11,7 @@ impl IndexingStrategy for SameDirectoryStrategy {
         if let Ok(entries) = fs::read_dir(target_path) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.is_file() && has_allowed_extension(&path, extensions) {
+                if path.is_file() && has_matching_extension(&path, extensions) {
                     results.push(path);
                 }
             }
