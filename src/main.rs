@@ -1,5 +1,6 @@
 mod vault;
 mod commands;
+mod color;
 
 use std::env;
 
