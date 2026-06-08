@@ -9,4 +9,10 @@ WALLMAN is a CLI-based wallpaper manager for Linux that works across multiple ba
 * Fast filtering and search (e.g., by ratio or color)
 * Set wallpapers using configurable backend engines
 * Lightweight, cross-backend CLI tool
+* Color Extraction in multiple ways 
+* Theme change of wallpaper eg :Dracula , Tokyo night 
+* Filtering like 1000 2000 wallpapers using color 
+* Filtering like 1000 2000 wallpapers using resolution 
+* Wallpaper renaming using CLIP/BLIP models 
+*  
 # Wallman
