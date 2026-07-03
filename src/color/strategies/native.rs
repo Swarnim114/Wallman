@@ -4,16 +4,77 @@ use std::path::Path;
 
 pub struct NativeColorExtractor;
 
-// pixels below this chroma value are "neutral" — greys, blacks, whites.
-// they never become accent colors. they only inform bg/fg and mode detection.
-// this is the single most important constant in this file.
+// only pixels above this chroma get into the accent pool
+// below this = too grey/muted to be a defining color
 const CHROMA_MIN: f64 = 0.09;
+
+// two accent colors this close in hue are basically duplicates
+const MIN_HUE_GAP: f64 = 30.0;
+
+// the minimum noticeability score any pixel can have, regardless of color
+// this is the "floor" — even pure black gets this much per pixel
+//
+// lower = blacks/greys need MORE coverage to show up in the palette
+// higher = blacks/greys can dominate even with moderate coverage
+//
+// sensible range: 0.01 (very low, only extreme coverage wins)
+//                 0.05 (default, black needs ~80% of image to beat vivid red)
+//                 0.15 (high, even small dark regions influence the palette a lot)
+const BASE_NOTICEABILITY: f64 = 0.01;
+
+// ─────────────────────────────────────────────────────────────
+// HUMAN NOTICEABILITY SCORE
+// ─────────────────────────────────────────────────────────────
+
+// how much would a human "notice" this one pixel?
+//
+// formula: 0.05 + chroma × bell_curve(lightness)
+//
+// the 0.05 floor is important — it means even pure black gets a non-zero
+// score. so if 95% of an image is black, black's aggregate score is
+// 38,000 × 0.05 = 1,900 which beats a handful of vivid pixels.
+//
+// the bell_curve peaks at L=0.5 and drops to 0 at L=0 and L=1,
+// which models how mid-lightness colors pop more than extremes.
+//
+// example scores:
+//   pure black  (L=0.02, C=0.00) → 0.05 + 0.0           = 0.050
+//   dark navy   (L=0.18, C=0.06) → 0.05 + 0.06 × 0.77   = 0.096
+//   vivid red   (L=0.45, C=0.28) → 0.05 + 0.28 × 0.99   = 0.327
+//   yellow-green(L=0.78, C=0.22) → 0.05 + 0.22 × 0.83   = 0.233
+//   near-white  (L=0.96, C=0.01) → 0.05 + 0.01 × 0.39   = 0.054
+fn noticeability(l: f64, c: f64) -> f64 {
+    let bell = (4.0 * l * (1.0 - l)).sqrt();
+    BASE_NOTICEABILITY + c * bell
+}
+
+// compute the noticeability-weighted average OKLCH of a slice of pixels
+// this answers: "what color does this region look like to a human overall?"
+//
+// used for bg (dark band average) and fg (bright band average)
+// so that coverage counts — 10,000 black pixels pull the average towards
+// black more than 100 vivid navy pixels pull it towards navy
+fn weighted_avg_oklch(pixels: &[(f64, f64, f64)]) -> Option<(f64, f64, f64)> {
+    let total_w: f64 = pixels.iter().map(|p| noticeability(p.0, p.1)).sum();
+    if total_w == 0.0 { return None; }
+
+    let avg_l = pixels.iter().map(|p| p.0 * noticeability(p.0, p.1)).sum::<f64>() / total_w;
+    let avg_c = pixels.iter().map(|p| p.1 * noticeability(p.0, p.1)).sum::<f64>() / total_w;
+
+    // circular mean for hue — handles the 0°/360° wraparound correctly
+    // (simple average would give wrong answer for e.g. 350° and 10°)
+    let sin_h: f64 = pixels.iter().map(|p| p.2.to_radians().sin() * noticeability(p.0, p.1)).sum::<f64>() / total_w;
+    let cos_h: f64 = pixels.iter().map(|p| p.2.to_radians().cos() * noticeability(p.0, p.1)).sum::<f64>() / total_w;
+    let avg_h = sin_h.atan2(cos_h).to_degrees().rem_euclid(360.0);
+
+    Some((avg_l, avg_c, avg_h))
+}
 
 // ─────────────────────────────────────────────────────────────
 // COLOR SPACE CONVERSIONS (sRGB ↔ OKLCH)
 // ─────────────────────────────────────────────────────────────
 
-// undo the gamma curve of sRGB before doing any math
+// undo sRGB gamma before doing any math — raw u8 values aren't linear light
 fn linearize(channel: u8) -> f64 {
     let v = channel as f64 / 255.0;
     if v <= 0.04045 {
@@ -23,7 +84,7 @@ fn linearize(channel: u8) -> f64 {
     }
 }
 
-// re-apply gamma when converting back to sRGB for display
+// re-apply gamma when going back to screen values
 fn delinearize(v: f64) -> u8 {
     let clamped = v.clamp(0.0, 1.0);
     let encoded = if clamped <= 0.0031308 {
@@ -34,26 +95,19 @@ fn delinearize(v: f64) -> u8 {
     (encoded * 255.0).round() as u8
 }
 
-// sRGB (u8) → OKLCH (L, C, H)
-//
-// OKLCH is a perceptual color space where equal numerical distances
-// look equally different to the human eye. much better than HSL for this.
-//
-//   L = lightness  (0.0 = black, 1.0 = white)
-//   C = chroma     (0.0 = grey, ~0.4 = very vivid)
-//   H = hue angle  (0–360°, like a color wheel)
+// sRGB → OKLCH
+// L = lightness (0–1), C = chroma (0 = grey, ~0.4 = vivid), H = hue (0–360°)
 fn rgb_to_oklch(r: u8, g: u8, b: u8) -> (f64, f64, f64) {
-    // undo gamma
     let r = linearize(r);
     let g = linearize(g);
     let b = linearize(b);
 
-    // linear RGB → XYZ (D65 illuminant, standard sRGB matrix)
+    // linear RGB → XYZ (D65)
     let x = 0.4124564 * r + 0.3575761 * g + 0.1804375 * b;
     let y = 0.2126729 * r + 0.7151522 * g + 0.0721750 * b;
     let z = 0.0193339 * r + 0.1191920 * g + 0.9503041 * b;
 
-    // XYZ → LMS (cone responses)
+    // XYZ → LMS
     let l = 0.8189330101 * x + 0.3618667424 * y - 0.1288597137 * z;
     let m = 0.0329845436 * x + 0.9293118715 * y + 0.0361456387 * z;
     let s = 0.0482003018 * x + 0.2643662691 * y + 0.6338517070 * z;
@@ -75,7 +129,7 @@ fn rgb_to_oklch(r: u8, g: u8, b: u8) -> (f64, f64, f64) {
     (ok_l, chroma, hue)
 }
 
-// OKLCH → sRGB (u8) — reverse pipeline
+// OKLCH → sRGB — reverse path, needed for generating bright variants
 fn oklch_to_rgb(l: f64, c: f64, h: f64) -> (u8, u8, u8) {
     let h_rad = h.to_radians();
     let ok_a  = c * h_rad.cos();
@@ -100,7 +154,7 @@ fn to_hex(r: u8, g: u8, b: u8) -> String {
     format!("#{:02X}{:02X}{:02X}", r, g, b)
 }
 
-// shortest angular distance between two hue angles, wraps around 0°/360°
+// shortest angular distance between two hue angles, handles 0°/360° wrap
 fn hue_dist(a: f64, b: f64) -> f64 {
     let d = (a - b).abs() % 360.0;
     if d > 180.0 { 360.0 - d } else { d }
@@ -113,13 +167,11 @@ fn hue_dist(a: f64, b: f64) -> f64 {
 impl ColorExtractingStrategy for NativeColorExtractor {
     fn extract(&self, image_path: &Path, _mode: ThemeMode) -> Result<ColorPalette, String> {
 
-        // load image and downsample to 200×200 grid — doing OKLCH math on a
-        // full 4K image would be pointlessly slow, 40k pixels is plenty
+        // load and downsample — 200×200 = 40k pixels, more than enough
         let img = MyImage::load(image_path.to_string_lossy().to_string())
             .map_err(|e| e.to_string())?;
         let grid = img.to_sampled_grid();
 
-        // convert every pixel to OKLCH — entering perceptual color space
         let mut all: Vec<(f64, f64, f64)> = Vec::with_capacity(200 * 200);
         for row in &grid {
             for &[r, g, b] in row {
@@ -127,144 +179,211 @@ impl ColorExtractingStrategy for NativeColorExtractor {
             }
         }
 
-        // ── SEPARATION ────────────────────────────────────────
-        // hard split: neutrals vs chromatic pixels
-        //
-        // neutrals (greys, blacks, whites) = chroma < CHROMA_MIN
-        //   → used ONLY for background, foreground, and mode detection
-        //   → NEVER become accent colors
-        //
-        // chromatic = chroma >= CHROMA_MIN
-        //   → these are the image's actual defining colors
-        //   → all accent slots come from here
-        //
-        let neutrals: Vec<_> = all.iter().filter(|p| p.1 < CHROMA_MIN).copied().collect();
-        let mut chromatic: Vec<_> = all.iter().filter(|p| p.1 >= CHROMA_MIN).copied().collect();
-
-        // sort chromatic by chroma descending — most vivid pixels float to the top
-        // this way the first candidate we find in a bucket is always the best one
-        chromatic.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-
-        // ── MODE DETECTION ────────────────────────────────────
-        // just average lightness over ALL pixels (not just neutrals)
+        // ── MODE DETECTION ─────────────────────────────────────
         let avg_l = all.iter().map(|p| p.0).sum::<f64>() / all.len() as f64;
         let theme_mode = if avg_l > 0.5 { ThemeMode::Light } else { ThemeMode::Dark };
 
-        // ── BACKGROUND & FOREGROUND ───────────────────────────
-        // pull these from the neutral pool — the actual grey/black/white tones
-        // if the image is so vivid it has almost no neutrals, fall back to all pixels
-
-        // bg = darkest neutral (the "black" of the theme)
-        let bg = neutrals.iter()
-            .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap())
-            .or_else(|| all.iter().min_by(|a, b| a.0.partial_cmp(&b.0).unwrap()))
-            .copied()
-            .unwrap_or((0.12, 0.0, 0.0));
-
-        // fg = brightest neutral (the "white" of the theme)
-        let fg = neutrals.iter()
-            .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap())
-            .or_else(|| all.iter().max_by(|a, b| a.0.partial_cmp(&b.0).unwrap()))
-            .copied()
-            .unwrap_or((0.92, 0.0, 0.0));
-
-        // ── HUE BUCKETING ────────────────────────────────────
-        // divide the hue wheel into 6 buckets of 60° each
-        // one per standard terminal accent color (red, yellow, green, cyan, blue, magenta)
+        // ── BACKGROUND & FOREGROUND ────────────────────────────
         //
-        // for each bucket:
-        //   1. find the most vivid (highest chroma) unused pixel in that hue range
-        //   2. if the bucket is empty (that hue doesn't exist in this image),
-        //      find the most vivid unused pixel closest in hue to this bucket's center
-        //      → this is way better than falling back to grey
+        // we split pixels into a dark band (bottom 20% by lightness) and a
+        // bright band (top 20%), then compute the noticeability-weighted average
+        // OKLCH of each band.
         //
-        // we track `used` to avoid the same pixel winning two adjacent buckets
+        // this means COVERAGE counts — if the dark band is 95% pure black,
+        // the weighted average will be very dark and nearly achromatic.
+        // if it's 60% black + 40% dark navy, the navy pulls the average toward blue.
+        // we're not picking one outlier pixel, we're asking "what does this band
+        // look like overall to a human?"
+        //
+        let mut sorted_by_l: Vec<f64> = all.iter().map(|p| p.0).collect();
+        sorted_by_l.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+        let dark_cutoff  = sorted_by_l[all.len() / 5];      // 20th percentile
+        let light_cutoff = sorted_by_l[all.len() * 4 / 5];  // 80th percentile
+
+        let dark_band:  Vec<_> = all.iter().filter(|p| p.0 <= dark_cutoff).copied().collect();
+        let light_band: Vec<_> = all.iter().filter(|p| p.0 >= light_cutoff).copied().collect();
+
+        let bg = weighted_avg_oklch(&dark_band).unwrap_or((0.12, 0.02, 250.0));
+        let fg = weighted_avg_oklch(&light_band).unwrap_or((0.90, 0.02, 80.0));
+
+        // ── ACCENT POOL ────────────────────────────────────────
+        // only vivid pixels (C >= CHROMA_MIN) are candidates for accent colors
+        let mut chromatic: Vec<_> = all.iter()
+            .filter(|p| p.1 >= CHROMA_MIN)
+            .copied()
+            .collect();
+
+        // ── BUCKET SCORING (coverage × noticeability) ──────────
+        //
+        // for each of the 6 hue buckets, sum up noticeability across all its pixels
+        // this is the core formula the user described:
+        //   bucket_score = Σ noticeability(L, C) for all chromatic pixels in that hue range
+        //
+        // a hue with 2000 moderately vivid pixels beats a hue with 10 very vivid pixels
+        // because area × noticeability > raw vividness
+        let mut bucket_scores = [0.0f64; 6];
+        for px in &chromatic {
+            let idx = (px.2 / 60.0) as usize % 6;
+            bucket_scores[idx] += noticeability(px.0, px.1);
+        }
+
+        // process buckets in order of their score — most "humanly important" hue goes first
+        // this matters for the fallback pool: if two buckets are empty and borrow from the
+        // same remaining pixels, the higher-scoring bucket gets first pick
+        let mut bucket_order: Vec<usize> = (0..6).collect();
+        bucket_order.sort_by(|&a, &b| bucket_scores[b].partial_cmp(&bucket_scores[a]).unwrap());
+
+        // sort chromatic by noticeability descending — best candidates first
+        chromatic.sort_by(|a, b| {
+            noticeability(b.0, b.1).partial_cmp(&noticeability(a.0, a.1)).unwrap()
+        });
+
         let mut used = vec![false; chromatic.len()];
-        let mut accents: Vec<(f64, f64, f64)> = Vec::with_capacity(6);
+        // accents indexed by BUCKET (0=red, 1=yellow, 2=green, 3=cyan, 4=blue, 5=magenta)
+        let mut accents: Vec<Option<(f64, f64, f64)>> = vec![None; 6];
 
-        for bucket in 0..6usize {
+        for &bucket in &bucket_order {
             let lo     = bucket as f64 * 60.0;
             let hi     = lo + 60.0;
             let center = lo + 30.0;
 
-            // first try: best vivid pixel squarely in this hue range
+            // primary: most noticeable unused pixel in this hue range
             let primary = chromatic.iter().enumerate()
                 .filter(|(i, px)| !used[*i] && px.2 >= lo && px.2 < hi)
-                .max_by(|(_, a), (_, b)| a.1.partial_cmp(&b.1).unwrap());
+                .max_by(|(_, a), (_, b)| {
+                    noticeability(a.0, a.1).partial_cmp(&noticeability(b.0, b.1)).unwrap()
+                });
 
             if let Some((idx, &best)) = primary {
                 used[idx] = true;
-                // small chroma boost — makes it pop a bit more in terminal themes
-                accents.push((best.0, (best.1 * 1.2).min(0.4), best.2));
+                accents[bucket] = Some((best.0, (best.1 * 1.2).min(0.4), best.2));
                 continue;
             }
 
-            // this hue range doesn't exist in the image
-            // score remaining pixels by: chroma * hue_proximity
-            // → prefers vivid colors that are also close to what we wanted
-            // → much better than a grey placeholder
+            // this hue doesn't exist in the image — borrow from pool
+            // score = noticeability × hue-proximity (prefer vivid AND close to what we wanted)
             let fallback = chromatic.iter().enumerate()
                 .filter(|(i, _)| !used[*i])
                 .max_by(|(_, a), (_, b)| {
-                    let score_a = a.1 * (1.0 - hue_dist(a.2, center) / 180.0);
-                    let score_b = b.1 * (1.0 - hue_dist(b.2, center) / 180.0);
+                    let score_a = noticeability(a.0, a.1) * (1.0 - hue_dist(a.2, center) / 180.0);
+                    let score_b = noticeability(b.0, b.1) * (1.0 - hue_dist(b.2, center) / 180.0);
                     score_a.partial_cmp(&score_b).unwrap()
                 });
 
             if let Some((idx, &best)) = fallback {
                 used[idx] = true;
-                accents.push((best.0, (best.1 * 1.2).min(0.4), best.2));
+                accents[bucket] = Some((best.0, (best.1 * 1.2).min(0.4), best.2));
             } else {
-                // image is basically monochrome — synthesize a neutral for this slot
-                // this path should almost never happen in practice
-                accents.push((0.5, 0.0, center));
+                // truly monochrome image — synthesize a neutral placeholder
+                accents[bucket] = Some((0.5, 0.0, center));
             }
         }
 
-        // ── ASSEMBLE THE 16-COLOR PALETTE ────────────────────
+        // flatten accents: unwrap each Option (they're all Some at this point)
+        let mut accents: Vec<(f64, f64, f64)> = accents.into_iter()
+            .map(|a| a.unwrap_or((0.5, 0.0, 0.0)))
+            .collect();
+
+        // ── DEDUPLICATION ──────────────────────────────────────
+        // if two accent slots are within MIN_HUE_GAP degrees of each other,
+        // they'll look almost identical in a terminal theme — replace the less
+        // vivid one with the best remaining chromatic color that keeps enough separation
         //
-        // terminal color slot layout:
-        //   0        → black (background)
-        //   1–6      → red, yellow, green, cyan, blue, magenta (normal)
-        //   7        → white (foreground)
-        //   8        → bright black (comments, inactive text)
-        //   9–14     → bright versions of 1–6
-        //   15       → bright white
+        // this loop repeats until no more duplicates exist (usually 0–1 iterations)
+        loop {
+            let mut replaced = false;
+
+            'pairs: for i in 0..accents.len() {
+                for j in (i + 1)..accents.len() {
+                    if hue_dist(accents[i].2, accents[j].2) < MIN_HUE_GAP {
+                        // the less noticeable one gets replaced
+                        let ni = noticeability(accents[i].0, accents[i].1);
+                        let nj = noticeability(accents[j].0, accents[j].1);
+                        let replace = if ni <= nj { i } else { j };
+
+                        // find the best unused pixel that's far enough from all kept accents
+                        let candidate = chromatic.iter().enumerate()
+                            .filter(|(u_idx, _)| !used[*u_idx])
+                            .filter(|(_, px)| {
+                                accents.iter().enumerate()
+                                    .filter(|(k, _)| *k != replace)
+                                    .all(|(_, other)| hue_dist(px.2, other.2) >= MIN_HUE_GAP)
+                            })
+                            .max_by(|(_, a), (_, b)| {
+                                noticeability(a.0, a.1).partial_cmp(&noticeability(b.0, b.1)).unwrap()
+                            });
+
+                        if let Some((u_idx, &best)) = candidate {
+                            used[u_idx] = true;
+                            accents[replace] = (best.0, (best.1 * 1.2).min(0.4), best.2);
+                            replaced = true;
+                            break 'pairs;
+                        }
+                        break 'pairs;
+                    }
+                }
+            }
+
+            if !replaced { break; }
+        }
+
+        // ── ASSEMBLE 16-COLOR PALETTE ──────────────────────────
+        //
+        // 0        → black  (background)
+        // 1–6      → accent colors (one per hue bucket)
+        // 7        → white  (foreground)
+        // 8        → bright black (comments, inactive UI)
+        // 9–14     → brighter versions of 1–6
+        // 15       → bright white
         //
         let mut colors: [String; 16] = Default::default();
 
-        // slot 0: background
         let (r, g, b) = oklch_to_rgb(bg.0, bg.1, bg.2);
         colors[0] = to_hex(r, g, b);
 
-        // slots 1–6: accent colors
         for (i, &(l, c, h)) in accents.iter().enumerate() {
             let (r, g, b) = oklch_to_rgb(l, c, h);
             colors[i + 1] = to_hex(r, g, b);
         }
 
-        // slot 7: foreground
         let (r, g, b) = oklch_to_rgb(fg.0, fg.1, fg.2);
         colors[7] = to_hex(r, g, b);
 
-        // slot 8: bright black — background shifted lighter
-        // terminals render this as the "dim" color for comments etc.
+        // bright black: bg lightness bumped up — used for dimmed/comment text
         let (r, g, b) = oklch_to_rgb((bg.0 + 0.15).min(0.95), bg.1, bg.2);
         colors[8] = to_hex(r, g, b);
 
-        // slots 9–14: bright accent variants — same hue and chroma, just lighter
+        // bright accents: same hue and chroma, just lighter
         for (i, &(l, c, h)) in accents.iter().enumerate() {
             let (r, g, b) = oklch_to_rgb((l + 0.10).min(0.95), c, h);
             colors[i + 9] = to_hex(r, g, b);
         }
 
-        // slot 15: bright white — fg pushed brighter, slightly desaturated
+        // bright white: fg pushed slightly brighter, chroma softened
         let (r, g, b) = oklch_to_rgb((fg.0 + 0.06).min(1.0), fg.1 * 0.4, fg.2);
         colors[15] = to_hex(r, g, b);
 
         let background = colors[0].clone();
         let foreground = colors[7].clone();
 
-        Ok(ColorPalette { mode: theme_mode, colors, background, foreground })
+        // secondary background: bg shifted a bit lighter
+        // this becomes the surface/panel color in a full theme (like Catppuccin's "surface0")
+        let (r, g, b) = oklch_to_rgb((bg.0 + 0.09).min(0.95), bg.1, bg.2);
+        let secondary_background = to_hex(r, g, b);
+
+        // secondary foreground: fg shifted a bit dimmer
+        // used for comments, subtext, anything that should feel "less important"
+        let (r, g, b) = oklch_to_rgb((fg.0 - 0.12).max(0.05), fg.1 * 0.85, fg.2);
+        let secondary_foreground = to_hex(r, g, b);
+
+        Ok(ColorPalette {
+            mode: theme_mode,
+            colors,
+            background,
+            secondary_background,
+            foreground,
+            secondary_foreground,
+        })
     }
 }

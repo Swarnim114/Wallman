@@ -47,11 +47,20 @@ pub fn execute(args: &[String]) {
             };
 
             println!("Detected   : {} mode", mode_label);
-            println!("Background : {}", palette.background);
-            println!("Foreground : {}", palette.foreground);
             println!();
 
-            // print all 16 colors as a table: normal (0–7) and bright (8–15) side by side
+            // ── Surface Colors ─────────────────────────────────
+            // these four form the "base layer" of a theme — backgrounds,
+            // text, panels, subtext — like Catppuccin's base/surface/text/subtext
+            println!("  Surface Colors");
+            println!("  ──────────────────────────────────────────");
+            print_surface_row("Background           ", &palette.background);
+            print_surface_row("Secondary Background ", &palette.secondary_background);
+            print_surface_row("Foreground           ", &palette.foreground);
+            print_surface_row("Secondary Foreground ", &palette.secondary_foreground);
+            println!();
+
+            // ── Accent Palette ─────────────────────────────────
             println!("  #   Normal      Bright");
             println!("  ─────────────────────────");
             for i in 0..8 {
@@ -64,8 +73,6 @@ pub fn execute(args: &[String]) {
             }
             println!();
 
-            // ANSI truecolor swatches — \x1b[48;2;R;G;Bm sets the terminal background color
-            // each "swatch" is just 3 spaces printed with that background color
             print_swatches("Normal", &palette.colors[0..8]);
             print_swatches("Bright", &palette.colors[8..16]);
         }
@@ -73,6 +80,16 @@ pub fn execute(args: &[String]) {
         Err(e) => {
             eprintln!("Failed to extract colors: {}", e);
         }
+    }
+}
+
+// prints one surface color row: label, hex value, and a small inline swatch
+fn print_surface_row(label: &str, hex: &str) {
+    if let Some((r, g, b)) = parse_hex(hex) {
+        println!(
+            "  {}  {}  \x1b[48;2;{};{};{}m   \x1b[0m",
+            label, hex, r, g, b
+        );
     }
 }
 
