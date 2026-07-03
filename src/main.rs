@@ -1,3 +1,4 @@
+//entry point for the program
 mod vault;
 mod commands;
 mod color;
@@ -11,7 +12,7 @@ fn main() {
 
     if args.len() < 2 {
         eprintln!("Usage: wallman <command> [args...]");
-        eprintln!("Commands: index");
+        eprintln!("Commands: index, colors");
         return;
     }
 
@@ -22,7 +23,8 @@ fn main() {
     let command_args = &args[1..];
 
     match command {
-        "index" => commands::index::execute(command_args),
-        _ => eprintln!("Unknown command: {}. Available commands: index", command),
+        "index"  => commands::index::execute(command_args),
+        "colors" => commands::colors::execute(command_args),
+        _ => eprintln!("Unknown command: {}. Available commands: index, colors", command),
     }
 }
